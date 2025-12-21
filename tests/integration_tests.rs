@@ -520,32 +520,6 @@ mod infra_integration_tests {
         assert!(arb_mask & 2 != 0, "Should detect Kalshi YES + Poly NO arb (bit 1)");
     }
 
-    /// Test: detects Polymarket-only arb (no fees)
-    #[test]
-    fn test_detects_poly_only_arb() {
-        // Poly YES 48¢ + Poly NO 50¢ = 98¢ → 2% profit with ZERO fees!
-        let (state, market_id) = setup_market(60, 60, 48, 50);
-
-        let market = state.get_by_id(market_id).unwrap();
-        let arb_mask = market.check_arbs(100);
-
-        assert!(arb_mask & 4 != 0, "Should detect Poly-only arb (bit 2)");
-    }
-
-    /// Test: detects Kalshi-only arb (double fees)
-    #[test]
-    fn test_detects_kalshi_only_arb() {
-        // Kalshi YES 44¢ + Kalshi NO 44¢ = 88¢ raw
-        // Double fee: ~4¢
-        // Effective = 92¢ → ARB!
-        let (state, market_id) = setup_market(44, 44, 60, 60);
-
-        let market = state.get_by_id(market_id).unwrap();
-        let arb_mask = market.check_arbs(100);
-
-        assert!(arb_mask & 8 != 0, "Should detect Kalshi-only arb (bit 3)");
-    }
-
     /// Test: correctly rejects marginal arb when fees eliminate profit
     #[test]
     fn test_fees_eliminate_marginal_arb() {
@@ -1259,12 +1233,10 @@ mod process_mock_tests {
         let matched = result.kalshi_filled.min(result.poly_filled);
         let actual_profit = matched as i16 * 100 - (result.kalshi_cost + result.poly_cost) as i16;
 
-        // Determine sides for position tracking
+        // Determine sides for position tracking (cross-platform only)
         let (kalshi_side, poly_side) = match req.arb_type {
             ArbType::PolyYesKalshiNo => ("no", "yes"),
             ArbType::KalshiYesPolyNo => ("yes", "no"),
-            ArbType::PolyOnly => ("", "both"),
-            ArbType::KalshiOnly => ("both", ""),
         };
 
         // Record success to circuit breaker
@@ -1828,118 +1800,8 @@ mod process_mock_tests {
     }
 
     // =========================================================================
-    // SAME-PLATFORM ARB TESTS (PolyOnly and KalshiOnly)
+    // CROSS-PLATFORM FEE TESTS
     // =========================================================================
-
-    /// Test: PolyOnly arb (Poly YES + Poly NO on same platform - zero Kalshi fees)
-    #[tokio::test]
-    async fn test_process_poly_only_arb() {
-        let tracker = Arc::new(RwLock::new(PositionTracker::new()));
-        let cb = CircuitBreaker::new(test_circuit_breaker_config());
-        let pair = test_market_pair();
-
-        // PolyOnly: Buy YES and NO both on Polymarket
-        // This is unusual but profitable when Poly YES + Poly NO < $1
-        let req = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 48,  // Poly YES at 48¢
-            no_price: 50,   // Poly NO at 50¢ (total = 98¢, 2¢ profit with NO fees!)
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::PolyOnly,
-            detected_ns: 0,
-        };
-
-        // For PolyOnly, both fills are from Polymarket
-        // In real execution: leg1 = Poly YES, leg2 = Poly NO
-        let result = MockExecutionResult {
-            kalshi_filled: 0,   // No Kalshi in PolyOnly
-            poly_filled: 10,    // Both YES and NO filled on Poly (combined)
-            kalshi_cost: 0,
-            poly_cost: 980,     // 10 × (48 + 50) = 980¢
-            kalshi_order_id: "".to_string(),
-            poly_order_id: "poly_both_order".to_string(),
-        };
-
-        // Note: PolyOnly doesn't fit our mock perfectly since it has 2 Poly fills
-        // But we can verify the ArbType is handled correctly
-        assert_eq!(req.estimated_fee_cents(), 0, "PolyOnly should have ZERO fees");
-        assert_eq!(req.profit_cents(), 2, "PolyOnly profit = 100 - 48 - 50 - 0 = 2¢");
-    }
-
-    /// Test: KalshiOnly arb (Kalshi YES + Kalshi NO on same platform - double fees)
-    #[tokio::test]
-    async fn test_process_kalshi_only_arb() {
-        let tracker = Arc::new(RwLock::new(PositionTracker::new()));
-        let cb = CircuitBreaker::new(test_circuit_breaker_config());
-        let pair = test_market_pair();
-
-        // KalshiOnly: Buy YES and NO both on Kalshi
-        // Must overcome DOUBLE fees (fee on YES side + fee on NO side)
-        let req = FastExecutionRequest {
-            market_id: 0,
-            yes_price: 44,  // Kalshi YES at 44¢
-            no_price: 44,   // Kalshi NO at 44¢ (raw = 88¢)
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiOnly,
-            detected_ns: 0,
-        };
-
-        // Double fee: kalshi_fee(44) + kalshi_fee(44)
-        // kalshi_fee(44) = ceil(7 * 44 * 56 / 10000) = ceil(1.7248) = 2¢
-        // Total fees = 2 + 2 = 4¢
-        let expected_fees = arb_bot::types::kalshi_fee_cents(44) + arb_bot::types::kalshi_fee_cents(44);
-        assert_eq!(req.estimated_fee_cents(), expected_fees, "KalshiOnly should have double fees");
-
-        // Profit = 100 - 44 - 44 - 4 = 8¢
-        assert_eq!(req.profit_cents(), 8, "KalshiOnly profit = 100 - 44 - 44 - 4 = 8¢");
-    }
-
-    /// Test: PolyOnly fee calculation is always zero
-    #[test]
-    fn test_poly_only_zero_fees() {
-        for yes_price in [10u16, 25, 50, 75, 90] {
-            for no_price in [10u16, 25, 50, 75, 90] {
-                let req = FastExecutionRequest {
-                    market_id: 0,
-                    yes_price,
-                    no_price,
-                    yes_size: 1000,
-                    no_size: 1000,
-                    arb_type: ArbType::PolyOnly,
-                    detected_ns: 0,
-                };
-                assert_eq!(req.estimated_fee_cents(), 0,
-                    "PolyOnly should always have 0 fees, got {} for prices ({}, {})",
-                    req.estimated_fee_cents(), yes_price, no_price);
-            }
-        }
-    }
-
-    /// Test: KalshiOnly fee calculation is double (fee on both YES and NO sides)
-    #[test]
-    fn test_kalshi_only_double_fees() {
-        use arb_bot::types::kalshi_fee_cents;
-
-        for yes_price in [10u16, 25, 50, 75, 90] {
-            for no_price in [10u16, 25, 50, 75, 90] {
-                let req = FastExecutionRequest {
-                    market_id: 0,
-                    yes_price,
-                    no_price,
-                    yes_size: 1000,
-                    no_size: 1000,
-                    arb_type: ArbType::KalshiOnly,
-                    detected_ns: 0,
-                };
-                let expected = kalshi_fee_cents(yes_price) + kalshi_fee_cents(no_price);
-                assert_eq!(req.estimated_fee_cents(), expected,
-                    "KalshiOnly fees should be {} for prices ({}, {}), got {}",
-                    expected, yes_price, no_price, req.estimated_fee_cents());
-            }
-        }
-    }
 
     /// Test: Cross-platform fee calculation (fee only on Kalshi side)
     #[test]
@@ -1973,38 +1835,12 @@ mod process_mock_tests {
             "KalshiYesPolyNo fee should be on YES side (40¢)");
     }
 
-    /// Test: Profit comparison across all arb types with same prices
+    /// Test: Both cross-platform types have same fees (one Kalshi side each)
     #[test]
-    fn test_profit_comparison_all_arb_types() {
-        use arb_bot::types::kalshi_fee_cents;
-
+    fn test_cross_platform_profit_comparison() {
         let yes_price = 45u16;
         let no_price = 45u16;
-        // Raw cost = 90¢, payout = 100¢
 
-        // PolyOnly: 0 fees → 10¢ profit
-        let poly_only = FastExecutionRequest {
-            market_id: 0,
-            yes_price,
-            no_price,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::PolyOnly,
-            detected_ns: 0,
-        };
-
-        // KalshiOnly: double fees → less profit
-        let kalshi_only = FastExecutionRequest {
-            market_id: 0,
-            yes_price,
-            no_price,
-            yes_size: 1000,
-            no_size: 1000,
-            arb_type: ArbType::KalshiOnly,
-            detected_ns: 0,
-        };
-
-        // Cross-platform: single fee
         let cross1 = FastExecutionRequest {
             market_id: 0,
             yes_price,
@@ -2024,20 +1860,6 @@ mod process_mock_tests {
             arb_type: ArbType::KalshiYesPolyNo,
             detected_ns: 0,
         };
-
-        // PolyOnly should always be most profitable (no fees)
-        assert!(poly_only.profit_cents() > kalshi_only.profit_cents(),
-            "PolyOnly ({}¢) should be more profitable than KalshiOnly ({}¢)",
-            poly_only.profit_cents(), kalshi_only.profit_cents());
-
-        assert!(poly_only.profit_cents() >= cross1.profit_cents(),
-            "PolyOnly ({}¢) should be >= cross-platform ({}¢)",
-            poly_only.profit_cents(), cross1.profit_cents());
-
-        // Cross-platform should be more profitable than KalshiOnly (single vs double fee)
-        assert!(cross1.profit_cents() > kalshi_only.profit_cents(),
-            "Cross-platform ({}¢) should be more profitable than KalshiOnly ({}¢)",
-            cross1.profit_cents(), kalshi_only.profit_cents());
 
         // Both cross-platform types have same fees (one Kalshi side each)
         assert_eq!(cross1.profit_cents(), cross2.profit_cents(),
